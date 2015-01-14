@@ -113,6 +113,26 @@ static ssize_t show_adapter_name(struct device *dev,
 }
 static DEVICE_ATTR(name, S_IRUGO, show_adapter_name, NULL);
 
+static ssize_t write_adapter_reset(struct device *dev, struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	struct i2c_adapter *adap = to_i2c_adapter(dev);
+	unsigned long val;
+	int ret;
+
+	if (!adap->reset)
+		return -EINVAL;
+
+	ret = strict_strtoul(buf, 10, &val);
+	if (ret || val != 1)
+		return -EINVAL;
+
+	adap->reset(adap);
+
+	return count;
+}
+static DEVICE_ATTR(reset, S_IWUSR, NULL, write_adapter_reset);
+
 /* ------------------------------------------------------------------------- */
 
 /*
