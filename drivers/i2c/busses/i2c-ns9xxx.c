@@ -227,6 +227,7 @@ static int ns9xxx_i2c_bitbang(struct ns9xxx_i2c *dev_data, struct i2c_msg *msg)
 	mdelay(1);
 
 	nr_bits = (msg->flags & I2C_M_TEN) ? 10 : 7;
+	printk(KERN_DEBUG "NS9XXX I2C: sending %d bits using bitbang-routine\n", nr_bits);
 	for (i = 0; i < nr_bits; i++) {
 		/* set data */
 		if (msg->addr & (1 << (nr_bits - i - 1)))
@@ -333,6 +334,7 @@ static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 	}
 
 	if (ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP)) {
+		printk(KERN_WARNING "NS9XXX I2C: interface seems to be stuck, trying to unlock\n");
 		/* sometimes interface gets stucked
 		 * try to fix this by send "start, nop, start" */
 		ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_NOP);
@@ -383,6 +385,9 @@ static int ns9xxx_i2c_set_clock(struct ns9xxx_i2c *dev_data, unsigned int freq)
 	}
 
 	writel(config, dev_data->ioaddr + I2C_CONFIG);
+	
+	printk(KERN_INFO "NS9XXX I2C: bus frequency set to %u, CPU clock = %lu, SCL_DELAY = %u, config -> 0x%lx\n", freq, (unsigned long)(clk_get_rate(dev_data->clk)), (unsigned int)SCL_DELAY, (unsigned long)config);
+
 
 	return 0;
 }
