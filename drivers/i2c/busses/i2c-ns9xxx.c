@@ -74,6 +74,7 @@
 	#define SCL_DELAY		16
 #elif defined(CONFIG_MACH_CME9210JS)
 	#define SCL_DELAY		306
+	//#define SCL_DELAY		25			// Alternative value worth trying?
 #elif defined(CONFIG_MACH_CC9P9360JS)
 	#define SCL_DELAY		12
 #elif defined(CONFIG_MACH_CC9CJS) || defined(CONFIG_MACH_CCW9CJS)
@@ -168,13 +169,17 @@ static int ns9xxx_i2c_send_cmd(struct ns9xxx_i2c *dev_data, unsigned int cmd)
 		writel(cmd, dev_data->ioaddr + I2C_CMD);
 		if (!wait_event_interruptible_timeout(dev_data->wait_q,
 					dev_data->state != I2C_INT_AWAITING,
-					dev_data->adap.timeout))
+					dev_data->adap.timeout)) {
+			printk(KERN_WARNING "NS9XXX I2C: timeout in ns9xxx_i2c_send_cmd() (cmd = %u, timeout = %d)\n", cmd, (int)(dev_data->adap.timeout));
 			return -ETIMEDOUT;
+		}
 	} while (dev_data->state == I2C_INT_AWAITING);
 
-	if (dev_data->state != I2C_INT_OK)
+	if (dev_data->state != I2C_INT_OK) {
+		printk(KERN_WARNING "NS9XXX I2C: state %d != I2C_INT_OK in ns9xxx_i2c_send_cmd()\n", dev_data->state);
 		return -EIO;
-
+	}
+	
 	return 0;
 }
 
@@ -255,6 +260,22 @@ static int ns9xxx_i2c_bitbang(struct ns9xxx_i2c *dev_data, struct i2c_msg *msg)
 	return ret ? 0 : -ENODEV;
 }
 
+
+static void ns9xxx_i2c_stop_bitbang(struct ns9xxx_i2c *dev_data)
+{
+	// Use GPIO to force a STOP 
+	
+	gpio_direction_output(dev_data->pdata->gpio_scl, 1);
+	mdelay(1);
+	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
+	mdelay(1);
+	
+	/* reset gpios to hardware i2c */
+	dev_data->pdata->gpio_configuration_func();
+
+}
+
+
 static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 		struct i2c_msg msgs[], int num)
 {
@@ -334,13 +355,25 @@ static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 	}
 
 	if (ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP)) {
-		printk(KERN_WARNING "NS9XXX I2C: interface seems to be stuck, trying to unlock\n");
+		u32 status, masteraddr, config; 
+		status = readl(dev_data->ioaddr + I2C_STATUS);
+		masteraddr = readl(dev_data->ioaddr + I2C_MASTERADDR);
+		config = readl(dev_data->ioaddr + I2C_CONFIG);
+		printk(KERN_WARNING "NS9XXX I2C: interface seems to be stuck, trying to unlock (STATUS %lx, MASTERADDR %lx, CONFIG %lx, state %lx)\n", (unsigned long)status, (unsigned long)masteraddr, (unsigned long)config, (unsigned long)dev_data->state);
 		/* sometimes interface gets stucked
 		 * try to fix this by send "start, nop, start" */
 		ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_NOP);
-		ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP);
+		if (ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP)) {
+			printk(KERN_WARNING "NS9XXX I2C: interface still stuck, forcing STOP using GPIO\n");
+			ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_NOP);
+			ns9xxx_i2c_stop_bitbang(dev_data);
+			status = readl(dev_data->ioaddr + I2C_STATUS);
+			masteraddr = readl(dev_data->ioaddr + I2C_MASTERADDR);
+			config = readl(dev_data->ioaddr + I2C_CONFIG);
+			printk(KERN_WARNING "NS9XXX I2C: STATUS %lx, MASTERADDR %lx, CONFIG %lx, state %lx\n", (unsigned long)status, (unsigned long)masteraddr, (unsigned long)config, (unsigned long)dev_data->state);
+		}
 	}
-
+	
 	spin_lock_irqsave(&dev_data->lock, flags);
 	dev_data->buf = NULL;
 	spin_unlock_irqrestore(&dev_data->lock, flags);
