@@ -66,6 +66,14 @@
 #define I2C_NORMALSPEED			100000
 #define I2C_HIGHSPEED			400000
 
+/* status bits */
+#define I2C_STATUS_BSTS			0x8000		/* Bus status */
+#define I2C_STATUS_RDE			0x4000		/* Receive datus available */
+#define I2C_STATUS_MCMDL		0x1000		/* Master command lock */
+#define I2C_STATUS_IRQCD_MASK	0x0f00		/* IRQ code (mask) */
+#define I2C_STATUS_RXDATA_MASK	0x00ff		/* Received data (mask) */
+
+
 /* SCL_DELAY
  * To fine adjust the formulas to the hardware reference manual
  * we define different SCL_DELAY per platform
@@ -125,23 +133,27 @@ static struct i2c_algorithm ns9xxx_i2c_algo = {
 	.functionality	= ns9xxx_i2c_func,
 };
 
+static int ns9xxx_i2c_set_clock(struct ns9xxx_i2c *dev_data, unsigned int freq);
+static int ns9xxx_wait_while_busy(struct ns9xxx_i2c *dev);
+
+
 static irqreturn_t ns9xxx_i2c_irq(int irqnr, void *dev_id)
 {
 	struct ns9xxx_i2c *dev_data = (struct ns9xxx_i2c *)dev_id;
-	unsigned int status;
+	u32 status;
 
-	/* acknowledge by reading */
-	status = readl(dev_data->ioaddr + I2C_CMD);
+	/* acknowledge IRQ by reading the status register */
+	status = readl(dev_data->ioaddr + I2C_STATUS);
 
 	if (dev_data->state != I2C_INT_AWAITING)
 		return IRQ_HANDLED;
 
-	switch (status & I2C_IRQ_MASK) {
+	spin_lock(&dev_data->lock);
+	
+	switch (status & I2C_STATUS_IRQCD_MASK) {
 	case I2C_IRQ_RXDATA:
-		spin_lock(&dev_data->lock);
 		if (dev_data->buf)
-			*dev_data->buf = status & 0xff;
-		spin_unlock(&dev_data->lock);
+			*dev_data->buf = status & I2C_STATUS_RXDATA_MASK;
 	case I2C_IRQ_CMDACK:
 	case I2C_IRQ_TXDATA:
 		dev_data->state = I2C_INT_OK;
@@ -157,6 +169,8 @@ static irqreturn_t ns9xxx_i2c_irq(int irqnr, void *dev_id)
 		dev_data->state = I2C_INT_ERROR;
 	}
 
+	spin_unlock(&dev_data->lock);
+
 	wake_up_interruptible(&dev_data->wait_q);
 
 	return IRQ_HANDLED;
@@ -164,16 +178,28 @@ static irqreturn_t ns9xxx_i2c_irq(int irqnr, void *dev_id)
 
 static int ns9xxx_i2c_send_cmd(struct ns9xxx_i2c *dev_data, unsigned int cmd)
 {
-	dev_data->state = I2C_INT_AWAITING;
-	do {
-		writel(cmd, dev_data->ioaddr + I2C_CMD);
-		if (!wait_event_interruptible_timeout(dev_data->wait_q,
-					dev_data->state != I2C_INT_AWAITING,
-					dev_data->adap.timeout)) {
-			printk(KERN_WARNING "NS9XXX I2C: timeout in ns9xxx_i2c_send_cmd() (cmd = %u, timeout = %d)\n", cmd, (int)(dev_data->adap.timeout));
+	unsigned long flags;
+	u32 status;
+		
+	status = readl(dev_data->ioaddr + I2C_STATUS);
+	if (status & I2C_STATUS_MCMDL) {
+		if (ns9xxx_wait_while_busy(dev_data)) {		/* Wait for previous command to finish */
+			printk(KERN_WARNING "NS9XXX I2C: timeout waiting for I2C master module to unlock\n");
 			return -ETIMEDOUT;
 		}
-	} while (dev_data->state == I2C_INT_AWAITING);
+	}
+	
+	spin_lock_irqsave(&dev_data->lock, flags);
+	dev_data->state = I2C_INT_AWAITING;
+	writel(cmd, dev_data->ioaddr + I2C_CMD);
+	spin_unlock_irqrestore(&dev_data->lock, flags);
+	
+	if (!wait_event_interruptible_timeout(dev_data->wait_q,
+				dev_data->state != I2C_INT_AWAITING,
+				dev_data->adap.timeout)) {
+		printk(KERN_WARNING "NS9XXX I2C: timeout waiting for interrupt (cmd = %u, timeout = %d)\n", cmd, (int)(dev_data->adap.timeout));
+		return -ETIMEDOUT;
+	}
 
 	if (dev_data->state != I2C_INT_OK) {
 		printk(KERN_WARNING "NS9XXX I2C: state %d != I2C_INT_OK in ns9xxx_i2c_send_cmd()\n", dev_data->state);
@@ -221,6 +247,8 @@ static int ns9xxx_i2c_bitbang(struct ns9xxx_i2c *dev_data, struct i2c_msg *msg)
 {
 	int i, nr_bits, ret;
 
+	disable_irq(dev_data->irq);		/* Disable our interrupt for a while */	
+		
 	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
 	gpio_direction_output(dev_data->pdata->gpio_scl, 1);
 	mdelay(10);
@@ -257,6 +285,11 @@ static int ns9xxx_i2c_bitbang(struct ns9xxx_i2c *dev_data, struct i2c_msg *msg)
 	/* stop */
 	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
 
+	/* reset gpios to hardware i2c */
+	dev_data->pdata->gpio_configuration_func();
+	
+	enable_irq(dev_data->irq);		/* Reenable our interrupt */
+
 	return ret ? 0 : -ENODEV;
 }
 
@@ -273,6 +306,159 @@ static void ns9xxx_i2c_stop_bitbang(struct ns9xxx_i2c *dev_data)
 	/* reset gpios to hardware i2c */
 	dev_data->pdata->gpio_configuration_func();
 
+}
+
+
+static void ns9xxx_i2c_reset_bitbang(struct ns9xxx_i2c *dev_data)
+{
+	// Use GPIO to force a bus-reset
+	
+	int i, scl, sda;
+	u32 status, masteraddr, config; 
+	
+	disable_irq(dev_data->irq);		/* Disable our interrupt for a while */	
+	
+	gpio_direction_input(dev_data->pdata->gpio_scl);
+	gpio_direction_input(dev_data->pdata->gpio_sda);
+	mdelay(1);
+	scl = gpio_get_value(dev_data->pdata->gpio_scl);
+	sda = gpio_get_value(dev_data->pdata->gpio_sda);
+
+	if (sda && scl) {
+		printk(KERN_DEBUG "NS9XXX I2C: bus-reset requested but bus seems idle, reset not needed?\n");
+	}
+	
+	/* Assert SDA, then check */
+	
+	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
+	mdelay(10);
+	gpio_direction_input(dev_data->pdata->gpio_sda);
+	mdelay(1);
+	sda = gpio_get_value(dev_data->pdata->gpio_sda);
+	
+	if (!sda) {
+		printk(KERN_DEBUG "NS9XXX I2C: SDA seems stuck, bus-reset needed.\n");
+	}
+	
+
+	for (i = 0; i < 9; i++) {
+		/* toggle clock */
+		gpio_direction_output(dev_data->pdata->gpio_scl, 1);
+		mdelay(1);
+		gpio_set_value(dev_data->pdata->gpio_scl, 0);
+		mdelay(1);
+		gpio_direction_input(dev_data->pdata->gpio_scl);
+		mdelay(1);
+		sda = gpio_get_value(dev_data->pdata->gpio_sda);
+		if (sda) {
+			printk(KERN_DEBUG "NS9XXX I2C: SDA high after %d clock cycles.\n", i);
+			break;
+		}
+	}
+
+	/* Send a STOP */
+	
+	gpio_direction_output(dev_data->pdata->gpio_scl, 1);
+	mdelay(1);
+	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
+	mdelay(1);
+
+	gpio_direction_input(dev_data->pdata->gpio_scl);
+	gpio_direction_input(dev_data->pdata->gpio_sda);
+	mdelay(1);
+	scl = gpio_get_value(dev_data->pdata->gpio_scl);
+	sda = gpio_get_value(dev_data->pdata->gpio_sda);
+	
+	if (scl == 0) {
+		printk(KERN_ERR "NS9XXX I2C: SCL seems to be held low externally?\n");
+	}
+	if (sda == 0) {
+		printk(KERN_ERR "NS9XXX I2C: SDA seems to be held low externally?\n");
+	}
+	
+	if (scl && sda) {
+		printk(KERN_DEBUG "NS9XXX I2C: reset successful, bus seems to be idle\n");
+	}
+	
+	/* reset gpios to hardware i2c */
+	dev_data->pdata->gpio_configuration_func();
+
+	status = readl(dev_data->ioaddr + I2C_STATUS);
+	masteraddr = readl(dev_data->ioaddr + I2C_MASTERADDR);
+	config = readl(dev_data->ioaddr + I2C_CONFIG);
+	printk(KERN_WARNING "NS9XXX I2C: STATUS %lx, MASTERADDR %lx, CONFIG %lx, state %lx\n", (unsigned long)status, (unsigned long)masteraddr, (unsigned long)config, (unsigned long)dev_data->state);
+
+	enable_irq(dev_data->irq);		/* Reenable our interrupt */
+}
+
+
+static void ns9xxx_reinit_i2c(struct ns9xxx_i2c *dev_data)
+{
+	u32 status;
+	int ret;
+	
+	ns9xxx_i2c_reset_bitbang(dev_data);		/* Try to reset the bus */
+
+	status = readl(dev_data->ioaddr + I2C_STATUS);
+	if (status & I2C_STATUS_MCMDL) {
+	
+		/* Master module still locked, try to reinitialise the I2C hardware */
+		
+		printk(KERN_WARNING "NS9XXX I2C: master module still locked (STATUS 0x%lx), trying to reinitialise hardware\n", (unsigned long)status);
+		
+		disable_irq(dev_data->irq);
+		
+		writel(I2C_CONFIG_IRQD | (0xf << I2C_CONFIG_SFW_SHIFT),
+			   dev_data->ioaddr + I2C_CONFIG);
+	
+		if (dev_data->pdata->speed)
+			ret = ns9xxx_i2c_set_clock(dev_data, dev_data->pdata->speed);
+		else
+			ret = ns9xxx_i2c_set_clock(dev_data, I2C_NORMALSPEED);
+		if (ret) {
+			printk(KERN_ERR "NS9XXX I2C: Error setting bus clock\n");
+		}
+		
+		enable_irq(dev_data->irq);
+		
+		writel(readl(dev_data->ioaddr + I2C_CONFIG) & ~I2C_CONFIG_IRQD,
+			dev_data->ioaddr + I2C_CONFIG);	
+	}
+}
+
+
+/* timeout waiting for the controller to respond (taken from the STU300 driver) */
+#define NS9XXX_TIMEOUT (msecs_to_jiffies(1000))
+#define BUSY_RELEASE_ATTEMPTS 10
+
+static int ns9xxx_wait_while_busy(struct ns9xxx_i2c *dev)
+{
+	/*
+	 * Waits for the busy bit to go low by repeated polling.
+	 */
+	 
+	unsigned long timeout;
+	int i;
+
+	for (i = 0; i < BUSY_RELEASE_ATTEMPTS; i++) {
+		timeout = jiffies + NS9XXX_TIMEOUT;
+
+		while (!time_after(jiffies, timeout)) {
+			/* Is not busy? */
+			if ((readl(dev->ioaddr + I2C_STATUS) &
+			     I2C_STATUS_MCMDL) == 0)
+				return 0;
+			msleep(1);
+		}
+
+		printk(KERN_WARNING "transaction timed out waiting for device to be free (not busy). Attempt: %d\n", i+1);
+		
+		ns9xxx_reinit_i2c(dev);
+	}
+
+	printk(KERN_ERR "giving up after %d attempts to reset the bus.\n",  BUSY_RELEASE_ATTEMPTS);
+
+	return -ETIMEDOUT;	
 }
 
 
@@ -305,8 +491,6 @@ static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 		if (msgs[i].len == 0) {
 			/* send using use bitbang mode */
 			ret = ns9xxx_i2c_bitbang(dev_data, &msgs[i]);
-			/* reset gpios to hardware i2c */
-			dev_data->pdata->gpio_configuration_func();
 		} else {
 			if (!(msgs[i].flags & I2C_M_NOSTART)) {
 				/* set device address */
@@ -318,8 +502,10 @@ static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 				else
 					reg |= I2C_MASTERADDR_7BIT;
 
+				spin_lock_irqsave(&dev_data->lock, flags);
 				writel(reg, dev_data->ioaddr +
 						I2C_MASTERADDR);
+				spin_unlock_irqrestore(&dev_data->lock, flags);
 
 				if (msgs[i].flags & I2C_M_RD)
 					cmd = I2C_CMD_READ;
@@ -355,22 +541,13 @@ static int ns9xxx_i2c_xfer(struct i2c_adapter *adap,
 	}
 
 	if (ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP)) {
-		u32 status, masteraddr, config; 
-		status = readl(dev_data->ioaddr + I2C_STATUS);
-		masteraddr = readl(dev_data->ioaddr + I2C_MASTERADDR);
-		config = readl(dev_data->ioaddr + I2C_CONFIG);
-		printk(KERN_WARNING "NS9XXX I2C: interface seems to be stuck, trying to unlock (STATUS %lx, MASTERADDR %lx, CONFIG %lx, state %lx)\n", (unsigned long)status, (unsigned long)masteraddr, (unsigned long)config, (unsigned long)dev_data->state);
+		printk(KERN_WARNING "NS9XXX I2C: interface seems to be stuck, trying to unlock (state %lx)\n", (unsigned long)dev_data->state);
 		/* sometimes interface gets stucked
 		 * try to fix this by send "start, nop, start" */
 		ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_NOP);
 		if (ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_STOP)) {
-			printk(KERN_WARNING "NS9XXX I2C: interface still stuck, forcing STOP using GPIO\n");
-			ns9xxx_i2c_send_cmd(dev_data, I2C_CMD_NOP);
-			ns9xxx_i2c_stop_bitbang(dev_data);
-			status = readl(dev_data->ioaddr + I2C_STATUS);
-			masteraddr = readl(dev_data->ioaddr + I2C_MASTERADDR);
-			config = readl(dev_data->ioaddr + I2C_CONFIG);
-			printk(KERN_WARNING "NS9XXX I2C: STATUS %lx, MASTERADDR %lx, CONFIG %lx, state %lx\n", (unsigned long)status, (unsigned long)masteraddr, (unsigned long)config, (unsigned long)dev_data->state);
+			printk(KERN_WARNING "NS9XXX I2C: interface still stuck, forcing bus-reset using GPIO\n");
+			ns9xxx_i2c_reset_bitbang(dev_data);
 		}
 	}
 	
