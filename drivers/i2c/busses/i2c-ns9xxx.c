@@ -81,8 +81,8 @@
 #if defined(CONFIG_MACH_CC9P9215JS) || defined(CONFIG_MACH_CCW9P9215JS)
 	#define SCL_DELAY		16
 #elif defined(CONFIG_MACH_CME9210JS)
-	#define SCL_DELAY		306
-	//#define SCL_DELAY		25			// Alternative value worth trying?
+	#define SCL_DELAY		306			// Original value
+	//#define SCL_DELAY		25			// Alternative value, seems much more stable
 #elif defined(CONFIG_MACH_CC9P9360JS)
 	#define SCL_DELAY		12
 #elif defined(CONFIG_MACH_CC9CJS) || defined(CONFIG_MACH_CCW9CJS)
@@ -198,6 +198,28 @@ static int ns9xxx_i2c_send_cmd(struct ns9xxx_i2c *dev_data, unsigned int cmd)
 				dev_data->state != I2C_INT_AWAITING,
 				dev_data->adap.timeout)) {
 		printk(KERN_WARNING "NS9XXX I2C: timeout waiting for interrupt (cmd = %u, timeout = %d)\n", cmd, (int)(dev_data->adap.timeout));
+		
+		if (ns9xxx_wait_while_busy(dev_data) == 0) {
+			printk(KERN_WARNING "NS9XXX I2C: bus seems free after waiting, but not retrying.\n");
+			
+			#if 0
+			// If bus is free, see if we can repeat the command
+			printk(KERN_WARNING "NS9XXX I2C: bus seems free, resetting bus and repeating command\n");
+			ns9xxx_i2c_reset_bitbang_blind(dev_data);		/* Try to reset the bus */
+			spin_lock_irqsave(&dev_data->lock, flags);
+			dev_data->state = I2C_INT_AWAITING;
+			writel(cmd, dev_data->ioaddr + I2C_CMD);
+			spin_unlock_irqrestore(&dev_data->lock, flags);
+			if (wait_event_interruptible_timeout(dev_data->wait_q,
+						dev_data->state != I2C_INT_AWAITING,
+						dev_data->adap.timeout)) {
+				return 0;
+			} else {
+				printk(KERN_WARNING "NS9XXX I2C: Timeout on second attempt, giving up.\n");
+			}
+			#endif
+		}
+		
 		return -ETIMEDOUT;
 	}
 
@@ -313,8 +335,9 @@ static void ns9xxx_i2c_reset_bitbang(struct ns9xxx_i2c *dev_data)
 {
 	// Use GPIO to force a bus-reset
 	
-	int i, scl, sda;
-	u32 status, masteraddr, config; 
+	int i, scl, sda, prev_sda;
+	u32 status, masteraddr, config;
+	int effective_cycles = 0;
 	
 	disable_irq(dev_data->irq);		/* Disable our interrupt for a while */	
 	
@@ -328,42 +351,38 @@ static void ns9xxx_i2c_reset_bitbang(struct ns9xxx_i2c *dev_data)
 		printk(KERN_DEBUG "NS9XXX I2C: bus-reset requested but bus seems idle, reset not needed?\n");
 	}
 	
-	/* Assert SDA, then check */
-	
-	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
-	mdelay(10);
-	gpio_direction_input(dev_data->pdata->gpio_sda);
-	mdelay(1);
-	sda = gpio_get_value(dev_data->pdata->gpio_sda);
-	
 	if (!sda) {
-		printk(KERN_DEBUG "NS9XXX I2C: SDA seems stuck, bus-reset needed.\n");
+		printk(KERN_DEBUG "NS9XXX I2C: SDA seems to be held low externally.\n");
 	}
 	
-
+	prev_sda = sda;
+	
 	for (i = 0; i < 9; i++) {
 		/* toggle clock */
-		gpio_direction_output(dev_data->pdata->gpio_scl, 1);
-		mdelay(1);
-		gpio_set_value(dev_data->pdata->gpio_scl, 0);
+
+		scl = gpio_get_value(dev_data->pdata->gpio_scl);
+		if (!scl) {
+			printk(KERN_DEBUG "NS9XXX I2C: SCL held low at start of clock cycle %d, continuing anyway.\n", i);
+		} else
+			effective_cycles++;
+		gpio_direction_output(dev_data->pdata->gpio_scl, 0);
 		mdelay(1);
 		gpio_direction_input(dev_data->pdata->gpio_scl);
-		mdelay(1);
 		sda = gpio_get_value(dev_data->pdata->gpio_sda);
-		if (sda) {
-			printk(KERN_DEBUG "NS9XXX I2C: SDA high after %d clock cycles.\n", i);
-			break;
+		scl = gpio_get_value(dev_data->pdata->gpio_scl);
+		if (sda != prev_sda) {
+			printk(KERN_DEBUG "NS9XXX I2C: SDA changed from %d to %d after %d clock cycles.\n", prev_sda, sda, i);
+			prev_sda = sda;
+		}
+		if (!scl) {
+			printk(KERN_DEBUG "NS9XXX I2C: SCL held low at end of clock cycle %d, 1 ms delay.\n", i);
+			mdelay(1);
 		}
 	}
 
 	/* Send a STOP */
 	
-	gpio_direction_output(dev_data->pdata->gpio_scl, 1);
 	mdelay(1);
-	gpio_direction_output(dev_data->pdata->gpio_sda, 1);
-	mdelay(1);
-
-	gpio_direction_input(dev_data->pdata->gpio_scl);
 	gpio_direction_input(dev_data->pdata->gpio_sda);
 	mdelay(1);
 	scl = gpio_get_value(dev_data->pdata->gpio_scl);
@@ -378,6 +397,8 @@ static void ns9xxx_i2c_reset_bitbang(struct ns9xxx_i2c *dev_data)
 	
 	if (scl && sda) {
 		printk(KERN_DEBUG "NS9XXX I2C: reset successful, bus seems to be idle\n");
+	} else {
+		printk(KERN_DEBUG "NS9XXX I2C: reset unsuccessful after %d effective cycles\n", effective_cycles);
 	}
 	
 	/* reset gpios to hardware i2c */
@@ -423,6 +444,8 @@ static void ns9xxx_reinit_i2c(struct ns9xxx_i2c *dev_data)
 		
 		writel(readl(dev_data->ioaddr + I2C_CONFIG) & ~I2C_CONFIG_IRQD,
 			dev_data->ioaddr + I2C_CONFIG);	
+	} else {
+		printk(KERN_DEBUG "NS9XXX I2C: master module idle (STATUS 0x%lx)\n", (unsigned long)status);
 	}
 }
 
@@ -438,16 +461,26 @@ static int ns9xxx_wait_while_busy(struct ns9xxx_i2c *dev)
 	 */
 	 
 	unsigned long timeout;
-	int i;
+	int i, status;
 
+	status = readl(dev->ioaddr + I2C_STATUS);
+	if ((status & I2C_STATUS_MCMDL) == 0)
+		return 0;								// Module is free to receive commands
+	
+	// Module seems to be locked
+	
 	for (i = 0; i < BUSY_RELEASE_ATTEMPTS; i++) {
 		timeout = jiffies + NS9XXX_TIMEOUT;
 
 		while (!time_after(jiffies, timeout)) {
 			/* Is not busy? */
-			if ((readl(dev->ioaddr + I2C_STATUS) &
-			     I2C_STATUS_MCMDL) == 0)
+			status = readl(dev->ioaddr + I2C_STATUS);
+			if ((status & I2C_STATUS_MCMDL) == 0) {
+				msleep(1);
+				status = readl(dev->ioaddr + I2C_STATUS);
+				printk(KERN_DEBUG "NS9XXX I2C: master module idle (STATUS 0x%lx)\n", (unsigned long)status);
 				return 0;
+			}
 			msleep(1);
 		}
 
