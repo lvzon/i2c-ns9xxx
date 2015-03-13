@@ -4,6 +4,7 @@
  * based on old i2c-ns9xxx.c by Digi International Inc.
  *
  * Copyright (C) 2008 by Digi International Inc.
+ * Modifications (C) 2015 by Levien van Zon (levien AT zonnetjes.net)
  * All rights reserved.
  *
  * This program is free software; you can redistribute it and/or modify it
@@ -20,6 +21,7 @@
 #include <linux/i2c-ns9xxx.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/moduleparam.h>
 
 #include <asm/gpio.h>
 #include <asm/io.h>
@@ -81,8 +83,8 @@
 #if defined(CONFIG_MACH_CC9P9215JS) || defined(CONFIG_MACH_CCW9P9215JS)
 	#define SCL_DELAY		16
 #elif defined(CONFIG_MACH_CME9210JS)
-	#define SCL_DELAY		306			// Original value
-	//#define SCL_DELAY		25			// Alternative value, seems much more stable
+	//#define SCL_DELAY		306			// Original value
+	#define SCL_DELAY		25			// Alternative value, seems much more stable
 #elif defined(CONFIG_MACH_CC9P9360JS)
 	#define SCL_DELAY		12
 #elif defined(CONFIG_MACH_CC9CJS) || defined(CONFIG_MACH_CCW9CJS)
@@ -92,6 +94,10 @@
 #endif
 
 #define DRIVER_NAME			"i2c-ns9xxx"
+
+static int scl_delay = SCL_DELAY;
+module_param(scl_delay, int, S_IRUSR | S_IRGRP | S_IROTH);
+MODULE_PARM_DESC(scl_delay, "SCL delay parameter for NS9xxx I2C");
 
 enum i2c_int_state {
 	I2C_INT_AWAITING,
@@ -606,7 +612,7 @@ static int ns9xxx_i2c_set_clock(struct ns9xxx_i2c *dev_data, unsigned int freq)
 		config &= ~I2C_CONFIG_VSCD;
 		/* Calculate CLKREF */
 		config |= (((clk_get_rate(dev_data->clk) / (4 * freq)) - 4 -
-			  SCL_DELAY) / 2) &
+			  scl_delay) / 2) &
 			  I2C_CONFIG_CLREFMASK;
 		break;
 #ifndef CONFIG_MACH_CME9210JS
@@ -617,7 +623,7 @@ static int ns9xxx_i2c_set_clock(struct ns9xxx_i2c *dev_data, unsigned int freq)
 		config &= ~I2C_CONFIG_VSCD;
 		/* Calculate CLKREF */
 		config |= (((clk_get_rate(dev_data->clk) / (4 * freq)) - 4 -
-			  SCL_DELAY) * 2 / 3) &
+			  scl_delay) * 2 / 3) &
 			  I2C_CONFIG_CLREFMASK;
 		break;
 #endif
@@ -629,7 +635,7 @@ static int ns9xxx_i2c_set_clock(struct ns9xxx_i2c *dev_data, unsigned int freq)
 
 	writel(config, dev_data->ioaddr + I2C_CONFIG);
 	
-	printk(KERN_INFO "NS9XXX I2C: bus frequency set to %u, CPU clock = %lu, SCL_DELAY = %u, config -> 0x%lx\n", freq, (unsigned long)(clk_get_rate(dev_data->clk)), (unsigned int)SCL_DELAY, (unsigned long)config);
+	printk(KERN_INFO "NS9XXX I2C: bus frequency set to %u, CPU clock = %lu, scl_delay = %u, config -> 0x%lx\n", freq, (unsigned long)(clk_get_rate(dev_data->clk)), (unsigned int)scl_delay, (unsigned long)config);
 
 
 	return 0;
