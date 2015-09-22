@@ -1,5 +1,5 @@
 # i2c-ns9xxx
-Modified I2C driver for the Digi NS9xxx platform.
+Modified I2C driver for the Digi NS9xxx platform (e.g. the NS9210 and NS9215 ARM9 SOC modules).
 
 
 While testing with a Digi Connect ME 9210 module, I2C-communications turned out to be unstable. The bus would lock up after a few hours. It turned out that the I2C bus speed was not set correctly by the Digi Linux driver. Moreover, the original driver did not implement error recovery, status checking and locking very well, and hardly produced useful output for debugging.
@@ -25,3 +25,9 @@ This is an attempt to fix the main issues with the Digi NS9xxx I2C-driver. Among
     - Add ns9xxx_wait_while_busy() to wait for the hardware to unlock
  - Make naming more consistent with the NS9xxx hardware manual
 
+
+### Further reading:
+
+ - [Digi NS9210 Processor Module Hardware Reference](http://ftp1.digi.com/support/documentation/90001002_A.pdf)
+ - [Digi NS9210 Hardware Reference Manual](http://www.digi.com/pdf/prd_ds_ns9210_hwman.pdf)
+ - [Digi Connect ME and Wi-ME Hardware Reference](http://www.digi.com/pdf/prd_ds_digiconnectme_hwman.pdf)
